@@ -465,4 +465,130 @@ def search_images(rag: RAGMultiModalModel, query: str, k: int = 5) -> List[Dict[
 # hits = search_images(rag, "validation ROC curve", k=5)
 # for h in hits:
 #     print(h["filename"], f"p{h['page']}", h["score"], "img?" if bool(h["image_base64"]) else "no-img")
+#######################################################################################################################
 
+## V6(To fix filename and path not in the metadata given we provided a path)
+
+# pip install byaldi
+from pathlib import Path
+from typing import List, Dict, Any, Iterable, Tuple
+import shutil
+from byaldi import RAGMultiModalModel
+
+MODEL_ID   = "vidore/colqwen2.5-v0.2"   # or "vidore/colpali"
+INDEX_NAME = "gov_pdf_byaldi"
+STAGE_DIR  = Path(".byaldi_stage") / INDEX_NAME
+
+# ---------- helpers ----------
+def _iter_pdfs(root: str, ignore_hidden: bool = True) -> Iterable[Path]:
+    root = Path(root).expanduser().resolve()
+    for p in root.rglob("*.pdf"):
+        if not p.is_file(): 
+            continue
+        rel_parts = p.relative_to(root).parts
+        if ignore_hidden and any(part.startswith(".") for part in rel_parts):
+            continue
+        if p.name.startswith("._"):          # macOS resource-fork junk
+            continue
+        yield p.resolve()
+
+def _stage_pdfs(root: str, dst: Path) -> List[Tuple[Path, Path]]:
+    """Copy PDFs to a clean mirror dir. Return list of (staged_path, original_path)."""
+    if dst.exists(): shutil.rmtree(dst)
+    dst.mkdir(parents=True, exist_ok=True)
+    src_root = Path(root).expanduser().resolve()
+
+    pairs: List[Tuple[Path, Path]] = []
+    for src in sorted(set(_iter_pdfs(src_root))):
+        rel = src.parent.relative_to(src_root)
+        out_dir = dst / rel
+        out_dir.mkdir(parents=True, exist_ok=True)
+        staged = out_dir / src.name
+        if not staged.exists():
+            shutil.copy2(src, staged)
+        pairs.append((staged, src))
+    if not pairs:
+        raise ValueError(f"No PDFs found under: {src_root}")
+    return pairs
+
+def _asdict(res: Any) -> Dict[str, Any]:
+    if isinstance(res, dict): 
+        return res
+    for m in ("model_dump", "dict"):
+        if hasattr(res, m):
+            try:
+                d = getattr(res, m)()
+                if isinstance(d, dict): return d
+            except TypeError:
+                pass
+    d = {}
+    for k in ("score","page_num","metadata","base64","image_base64","b64_image","source","path","file_path","document"):
+        if hasattr(res, k): d[k] = getattr(res, k)
+    try: d.update(dict(res))
+    except Exception: pass
+    return d
+
+def _norm(res: Any) -> Dict[str, Any]:
+    r     = _asdict(res)
+    score = r.get("score")
+    page  = int(r.get("page_num", 1))
+    meta  = r.get("metadata") or {}
+    if hasattr(meta, "model_dump"): meta = meta.model_dump()
+    elif hasattr(meta, "dict"):
+        try: meta = meta.dict()
+        except Exception: pass
+    path  = (meta.get("path") or r.get("path") or r.get("source") or r.get("file_path") or r.get("document"))
+    b64   = r.get("base64") or r.get("image_base64") or r.get("b64_image")
+    return {
+        "filename": Path(path).name if path else None,
+        "path": path,
+        "page": page,
+        "score": float(score) if score is not None else None,
+        "image_base64": b64,
+        "metadata": meta,
+        "raw": r,
+    }
+
+# ---------- core api ----------
+def build_pdf_index(pdf_root: str, index_name: str = INDEX_NAME) -> RAGMultiModalModel:
+    """
+    Build index with per-file metadata so search results include 'path' and 'filename'.
+    """
+    pairs = _stage_pdfs(pdf_root, STAGE_DIR)  # (staged, original)
+    rag = RAGMultiModalModel.from_pretrained(MODEL_ID)
+
+    # Seed with first file
+    first_staged, first_src = pairs[0]
+    rag.index(
+        input_path=str(first_staged),
+        index_name=index_name,
+        store_collection_with_index=True,
+        metadata=[{"path": str(first_src), "filename": first_src.name}],
+        overwrite=True,
+    )
+    # Append the rest
+    for staged, src in pairs[1:]:
+        try:
+            rag.add_to_index(
+                str(staged),
+                store_collection_with_index=True,
+                metadata=[{"path": str(src), "filename": src.name}],
+            )
+        except TypeError:
+            # In case your Byaldi build doesn't accept metadata here
+            rag.add_to_index(str(staged), store_collection_with_index=True)
+
+    return rag
+
+def load_pdf_index(index_name: str = INDEX_NAME) -> RAGMultiModalModel:
+    return RAGMultiModalModel.from_index(index_name)
+
+def search_images(rag: RAGMultiModalModel, query: str, k: int = 5) -> List[Dict[str, Any]]:
+    return [_norm(h) for h in rag.search(query, k=k)]
+
+# ---------- example ----------
+# rag = build_pdf_index("/path/to/folder_with_pdfs")
+# # (later) rag = load_pdf_index()
+# hits = search_images(rag, "validation ROC curve", k=5)
+# for h in hits:
+#     print(h["filename"], h["path"], f"p{h['page']}", h["score"], "img?" if bool(h["image_base64"]) else "no-img")
